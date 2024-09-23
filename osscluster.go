@@ -1430,6 +1430,21 @@ func (c *ClusterClient) processTxPipeline(ctx context.Context, cmds []Cmder) err
 			}
 
 			failedCmds := newCmdsMap()
+
+			// If there's only a single node to process, run in the current goroutine
+			if len(cmdsMap) == 1 {
+				for node, cmds := range cmdsMap {
+					c.processTxPipelineNode(ctx, node, cmds, failedCmds)
+				}
+
+				if len(failedCmds.m) == 0 {
+					break
+				}
+
+				cmdsMap = failedCmds.m
+				continue
+			}
+
 			var wg sync.WaitGroup
 
 			for node, cmds := range cmdsMap {
