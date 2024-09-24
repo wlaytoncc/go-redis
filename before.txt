@@ -1,0 +1,21 @@
+goos: linux
+goarch: amd64
+pkg: github.com/redis/go-redis/v9
+cpu: 12th Gen Intel(R) Core(TM) i7-1260P
+BenchmarkClusterTxPipeline-16    	  165199	      7337 ns/op	    1728 B/op	      39 allocs/op
+PASS
+ok  	github.com/redis/go-redis/v9	67.912s
+PASS
+ok  	github.com/redis/go-redis/v9/doctests	0.003s
+PASS
+ok  	github.com/redis/go-redis/v9/internal	0.002s
+PASS
+ok  	github.com/redis/go-redis/v9/internal/hashtag	0.003s
+PASS
+ok  	github.com/redis/go-redis/v9/internal/hscan	0.003s
+PASS
+ok  	github.com/redis/go-redis/v9/internal/pool	0.003s
+PASS
+ok  	github.com/redis/go-redis/v9/internal/proto	0.003s
+?   	github.com/redis/go-redis/v9/internal/rand	[no test files]
+?   	github.com/redis/go-redis/v9/internal/util	[no test files]
