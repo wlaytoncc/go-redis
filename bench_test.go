@@ -385,11 +385,20 @@ func BenchmarkClusterPipeline(b *testing.B) {
 
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			_, err := client.Pipelined(ctx, func(pipe redis.Pipeliner) error {
-				pipe.Set(ctx, "key", "hello", 0)
-				pipe.Expire(ctx, "key", time.Second)
+			result, err := client.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+				pipe.HSet(ctx, "key", "a", "1")
+				pipe.HSet(ctx, "key", "b", "1")
+				pipe.HSet(ctx, "key", "c", "1")
+				pipe.HSet(ctx, "key", "d", "1")
+				pipe.HSet(ctx, "key", "e", "1")
+				pipe.HSet(ctx, "key", "f", "1")
 				return nil
 			})
+
+			if len(result) != 6 {
+				b.Fatalf("Unexpected number of results: %d", len(result))
+			}
+
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -416,11 +425,20 @@ func BenchmarkClusterTxPipeline(b *testing.B) {
 
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			_, err := client.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-				pipe.Set(ctx, "key", "hello", 0)
-				pipe.Expire(ctx, "key", time.Second)
+			result, err := client.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+				pipe.HSet(ctx, "key", "a", "1")
+				pipe.HSet(ctx, "key", "b", "1")
+				pipe.HSet(ctx, "key", "c", "1")
+				pipe.HSet(ctx, "key", "d", "1")
+				pipe.HSet(ctx, "key", "e", "1")
+				pipe.HSet(ctx, "key", "f", "1")
 				return nil
 			})
+
+			if len(result) != 6 {
+				b.Fatalf("Unexpected number of results: %d", len(result))
+			}
+
 			if err != nil {
 				b.Fatal(err)
 			}
