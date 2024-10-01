@@ -1568,6 +1568,8 @@ func (c *ClusterClient) processTxPipelineNodeConn(
 	}
 
 	return cn.WithReader(c.context(ctx), c.opt.ReadTimeout, func(rd *proto.Reader) error {
+		errorsCollection := []error{}
+
 		for i := 0; i < len(multiIndexes); i++ {
 			statusCmd, ok := cmds[multiIndexes[i]].(*StatusCmd)
 			if !ok {
@@ -1586,19 +1588,29 @@ func (c *ClusterClient) processTxPipelineNodeConn(
 			if err := c.txPipelineReadQueued(
 				ctx, rd, statusCmd, trimmedCmds, failedCmds,
 			); err != nil {
-				setCmdsErr(cmds, err)
+				setCmdsErr(trimmedCmds, err)
 
 				moved, ask, addr := isMovedError(err)
 				if moved || ask {
-					return c.cmdsMoved(ctx, trimmedCmds, moved, ask, addr, failedCmds)
+					err = c.cmdsMoved(ctx, trimmedCmds, moved, ask, addr, failedCmds)
+					if err != nil {
+						errorsCollection = append(errorsCollection, err)
+					}
+					continue
 				}
 
-				return err
+				errorsCollection = append(errorsCollection, err)
+				continue
 			}
 
 			if err := pipelineReadCmds(rd, trimmedCmds); err != nil {
-				return err
+				errorsCollection = append(errorsCollection, err)
+				continue
 			}
+		}
+
+		if len(errorsCollection) != 0 {
+			return errors.Join(errorsCollection...)
 		}
 
 		return nil
