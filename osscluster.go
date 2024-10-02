@@ -1415,7 +1415,7 @@ func (c *ClusterClient) processTxPipeline(ctx context.Context, cmds []Cmder) err
 
 	cmdsMap := c.mapCmdsBySlot(ctx, cmds)
 
-	cmdsMap2 := map[*clusterNode][]Cmder{}
+	cmdsByNode := map[*clusterNode][]Cmder{}
 
 	for slot, cmds := range cmdsMap {
 		node, err := state.slotMasterNode(slot)
@@ -1424,16 +1424,16 @@ func (c *ClusterClient) processTxPipeline(ctx context.Context, cmds []Cmder) err
 			continue
 		}
 
-		_, ok := cmdsMap2[node]
+		_, ok := cmdsByNode[node]
 		if !ok {
-			cmdsMap2[node] = cmds
+			cmdsByNode[node] = cmds
 			continue
 		}
 
-		cmdsMap2[node] = append(cmdsMap2[node], cmds...)
+		cmdsByNode[node] = append(cmdsByNode[node], cmds...)
 	}
 
-	for _, cmds := range cmdsMap2 {
+	for _, cmds := range cmdsByNode {
 		for attempt := 0; attempt <= c.opt.MaxRedirects; attempt++ {
 			if attempt > 0 {
 				if err := internal.Sleep(ctx, c.retryBackoff(attempt)); err != nil {
@@ -1445,8 +1445,8 @@ func (c *ClusterClient) processTxPipeline(ctx context.Context, cmds []Cmder) err
 			failedCmds := newCmdsMap()
 
 			// If there's only a single node to process, run in the current goroutine
-			if len(cmdsMap2) == 1 {
-				for node, cmds := range cmdsMap2 {
+			if len(cmdsByNode) == 1 {
+				for node, cmds := range cmdsByNode {
 					c.processTxPipelineNode(ctx, node, cmds, failedCmds)
 				}
 
@@ -1454,14 +1454,15 @@ func (c *ClusterClient) processTxPipeline(ctx context.Context, cmds []Cmder) err
 					break
 				}
 
-				cmdsMap2 = failedCmds.m
+				cmdsByNode = failedCmds.m
 				continue
 			}
 
-			internal.Logger.Printf(context.TODO(), "More than 1 node to process: %d\n", len(cmdsMap2))
+			internal.Logger.Printf(context.TODO(), "More than 1 node to process: %d\n", len(cmdsByNode))
+
 			var wg sync.WaitGroup
 
-			for node, cmds := range cmdsMap2 {
+			for node, cmds := range cmdsByNode {
 				wg.Add(1)
 				go func(node *clusterNode, cmds []Cmder) {
 					defer wg.Done()
@@ -1473,7 +1474,7 @@ func (c *ClusterClient) processTxPipeline(ctx context.Context, cmds []Cmder) err
 			if len(failedCmds.m) == 0 {
 				break
 			}
-			cmdsMap2 = failedCmds.m
+			cmdsByNode = failedCmds.m
 		}
 	}
 
@@ -1493,7 +1494,6 @@ func (c *ClusterClient) processTxPipelineNode(
 	ctx context.Context, node *clusterNode, cmds []Cmder, failedCmds *cmdsMap,
 ) {
 	cmds, multiIndexes := c.wrapMultiExec(ctx, cmds)
-	// cmds = wrapMultiExec(ctx, cmds)
 	_ = node.Client.withProcessPipelineHook(ctx, cmds, func(ctx context.Context, cmds []Cmder) error {
 		cn, err := node.Client.getConn(ctx)
 		if err != nil {
@@ -1513,21 +1513,20 @@ func (c *ClusterClient) processTxPipelineNode(
 }
 
 func (c *ClusterClient) wrapMultiExec(ctx context.Context, cmds []Cmder) ([]Cmder, []int) {
-	if len(cmds) == 0 {
-		panic("not reached")
-	}
-
 	cmdsCopy := make([]Cmder, 0, len(cmds)+2)
+
 	cmdsCopy = append(cmdsCopy, NewStatusCmd(ctx, "multi"))
 
+	// Store the index of each `multi` in cmdsCopy
 	multiIndexes := []int{0}
 
+	// Maintain the slot on each iteration to detect when the current transaction should be ended & next one started
 	lastSlot := 0
 
 	for i := 0; i < len(cmds); i++ {
 		slot := c.cmdSlot(ctx, cmds[i])
 
-		if slot != lastSlot && i > 0 {
+		if i > 0 && slot != lastSlot {
 			cmdsCopy = append(cmdsCopy, NewStatusCmd(ctx, "exec"), NewStatusCmd(ctx, "multi"))
 			multiIndexes = append(multiIndexes, len(cmdsCopy)-1)
 		}
@@ -1558,6 +1557,7 @@ func (c *ClusterClient) processTxPipelineNodeConn(
 	return cn.WithReader(c.context(ctx), c.opt.ReadTimeout, func(rd *proto.Reader) error {
 		errorsCollection := []error{}
 
+		// Use the index of each transaction to help check the expected responses
 		for i := 0; i < len(multiIndexes); i++ {
 			statusCmd, ok := cmds[multiIndexes[i]].(*StatusCmd)
 			if !ok {
@@ -1570,7 +1570,7 @@ func (c *ClusterClient) processTxPipelineNodeConn(
 				exec = multiIndexes[i+1]
 			}
 
-			// Trim multi and exec.
+			// Trim multi and exec off this transaction
 			trimmedCmds := cmds[multiIndexes[i]+1 : exec-1]
 
 			if err := c.txPipelineReadQueued(
