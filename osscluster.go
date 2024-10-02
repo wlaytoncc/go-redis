@@ -1413,16 +1413,7 @@ func (c *ClusterClient) processTxPipeline(ctx context.Context, cmds []Cmder) err
 		return err
 	}
 
-	// var cmdsMap cmdsMap
 	cmdsMap := c.mapCmdsBySlot(ctx, cmds)
-	// err = c.mapCmdsByNode(ctx, cmdsMap, cmds)
-	// if err != nil {
-	// 	fmt.Printf("mapCmdsByNode err: %s\n", err.Error())
-	// 	setCmdsErr(cmds, err)
-	// 	return err
-	// }
-
-	// fmt.Printf("Slots to process: %d\n", len(cmdsMap))
 
 	cmdsMap2 := map[*clusterNode][]Cmder{}
 
@@ -1439,11 +1430,9 @@ func (c *ClusterClient) processTxPipeline(ctx context.Context, cmds []Cmder) err
 			continue
 		}
 
-		// nodeEntry =
 		cmdsMap2[node] = append(cmdsMap2[node], cmds...)
 	}
 
-	// cmdsMap := map[*clusterNode][]Cmder{node: cmds}
 	for _, cmds := range cmdsMap2 {
 		for attempt := 0; attempt <= c.opt.MaxRedirects; attempt++ {
 			if attempt > 0 {
@@ -1457,7 +1446,6 @@ func (c *ClusterClient) processTxPipeline(ctx context.Context, cmds []Cmder) err
 
 			// If there's only a single node to process, run in the current goroutine
 			if len(cmdsMap2) == 1 {
-				// fmt.Printf("1 node to process: %+v\n", cmds)
 				for node, cmds := range cmdsMap2 {
 					c.processTxPipelineNode(ctx, node, cmds, failedCmds)
 				}
@@ -1470,7 +1458,7 @@ func (c *ClusterClient) processTxPipeline(ctx context.Context, cmds []Cmder) err
 				continue
 			}
 
-			fmt.Printf("More than 1 node to process: %d\n", len(cmdsMap2))
+			internal.Logger.Printf(context.TODO(), "More than 1 node to process: %d\n", len(cmdsMap2))
 			var wg sync.WaitGroup
 
 			for node, cmds := range cmdsMap2 {
