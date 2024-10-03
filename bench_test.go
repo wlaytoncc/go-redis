@@ -366,6 +366,84 @@ func BenchmarkClusterSetString(b *testing.B) {
 	})
 }
 
+func BenchmarkClusterPipeline(b *testing.B) {
+	if testing.Short() {
+		b.Skip("skipping in short mode")
+	}
+
+	ctx := context.Background()
+	cluster := newClusterScenario()
+	if err := startCluster(ctx, cluster); err != nil {
+		b.Fatal(err)
+	}
+	defer cluster.Close()
+
+	client := cluster.newClusterClient(ctx, redisClusterOptions())
+	defer client.Close()
+
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			result, err := client.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+				pipe.HSet(ctx, "key", "a", "1")
+				pipe.HSet(ctx, "key", "b", "1")
+				pipe.HSet(ctx, "key", "c", "1")
+				pipe.HSet(ctx, "key", "d", "1")
+				pipe.HSet(ctx, "key", "e", "1")
+				pipe.HSet(ctx, "key", "f", "1")
+				return nil
+			})
+
+			if len(result) != 6 {
+				b.Fatalf("Unexpected number of results: %d", len(result))
+			}
+
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+func BenchmarkClusterTxPipeline(b *testing.B) {
+	if testing.Short() {
+		b.Skip("skipping in short mode")
+	}
+
+	ctx := context.Background()
+	cluster := newClusterScenario()
+	if err := startCluster(ctx, cluster); err != nil {
+		b.Fatal(err)
+	}
+	defer cluster.Close()
+
+	client := cluster.newClusterClient(ctx, redisClusterOptions())
+	defer client.Close()
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		result, err := client.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			pipe.HSet(ctx, "key", "a", "1")
+			pipe.HSet(ctx, "key", "b", "1")
+			pipe.HSet(ctx, "key", "c", "1")
+			pipe.HSet(ctx, "key", "d", "1")
+			pipe.HSet(ctx, "key", "e", "1")
+			pipe.HSet(ctx, "key", "f", "1")
+			return nil
+		})
+
+		if len(result) != 6 {
+			b.Fatalf("Unexpected number of results: %d", len(result))
+		}
+
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkExecRingSetAddrsCmd(b *testing.B) {
 	const (
 		ringShard1Name = "ringShardOne"

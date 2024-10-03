@@ -3,6 +3,7 @@ package redis
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"math"
 	"net"
@@ -1413,6 +1414,9 @@ func (c *ClusterClient) processTxPipeline(ctx context.Context, cmds []Cmder) err
 	}
 
 	cmdsMap := c.mapCmdsBySlot(ctx, cmds)
+
+	cmdsByNode := map[*clusterNode][]Cmder{}
+
 	for slot, cmds := range cmdsMap {
 		node, err := state.slotMasterNode(slot)
 		if err != nil {
@@ -1420,7 +1424,16 @@ func (c *ClusterClient) processTxPipeline(ctx context.Context, cmds []Cmder) err
 			continue
 		}
 
-		cmdsMap := map[*clusterNode][]Cmder{node: cmds}
+		_, ok := cmdsByNode[node]
+		if !ok {
+			cmdsByNode[node] = cmds
+			continue
+		}
+
+		cmdsByNode[node] = append(cmdsByNode[node], cmds...)
+	}
+
+	for _, cmds := range cmdsByNode {
 		for attempt := 0; attempt <= c.opt.MaxRedirects; attempt++ {
 			if attempt > 0 {
 				if err := internal.Sleep(ctx, c.retryBackoff(attempt)); err != nil {
@@ -1430,9 +1443,26 @@ func (c *ClusterClient) processTxPipeline(ctx context.Context, cmds []Cmder) err
 			}
 
 			failedCmds := newCmdsMap()
+
+			// If there's only a single node to process, run in the current goroutine
+			if len(cmdsByNode) == 1 {
+				for node, cmds := range cmdsByNode {
+					c.processTxPipelineNode(ctx, node, cmds, failedCmds)
+				}
+
+				if len(failedCmds.m) == 0 {
+					break
+				}
+
+				cmdsByNode = failedCmds.m
+				continue
+			}
+
+			internal.Logger.Printf(context.TODO(), "More than 1 node to process: %d\n", len(cmdsByNode))
+
 			var wg sync.WaitGroup
 
-			for node, cmds := range cmdsMap {
+			for node, cmds := range cmdsByNode {
 				wg.Add(1)
 				go func(node *clusterNode, cmds []Cmder) {
 					defer wg.Done()
@@ -1444,7 +1474,7 @@ func (c *ClusterClient) processTxPipeline(ctx context.Context, cmds []Cmder) err
 			if len(failedCmds.m) == 0 {
 				break
 			}
-			cmdsMap = failedCmds.m
+			cmdsByNode = failedCmds.m
 		}
 	}
 
@@ -1463,7 +1493,7 @@ func (c *ClusterClient) mapCmdsBySlot(ctx context.Context, cmds []Cmder) map[int
 func (c *ClusterClient) processTxPipelineNode(
 	ctx context.Context, node *clusterNode, cmds []Cmder, failedCmds *cmdsMap,
 ) {
-	cmds = wrapMultiExec(ctx, cmds)
+	cmds, multiIndexes := c.wrapMultiExec(ctx, cmds)
 	_ = node.Client.withProcessPipelineHook(ctx, cmds, func(ctx context.Context, cmds []Cmder) error {
 		cn, err := node.Client.getConn(ctx)
 		if err != nil {
@@ -1476,14 +1506,43 @@ func (c *ClusterClient) processTxPipelineNode(
 		defer func() {
 			node.Client.releaseConn(ctx, cn, processErr)
 		}()
-		processErr = c.processTxPipelineNodeConn(ctx, node, cn, cmds, failedCmds)
+		processErr = c.processTxPipelineNodeConn(ctx, node, cn, cmds, multiIndexes, failedCmds)
 
 		return processErr
 	})
 }
 
+func (c *ClusterClient) wrapMultiExec(ctx context.Context, cmds []Cmder) ([]Cmder, []int) {
+	cmdsCopy := make([]Cmder, 0, len(cmds)+2)
+
+	cmdsCopy = append(cmdsCopy, NewStatusCmd(ctx, "multi"))
+
+	// Store the index of each `multi` in cmdsCopy
+	multiIndexes := []int{0}
+
+	// Maintain the slot on each iteration to detect when the current transaction should be ended & next one started
+	lastSlot := 0
+
+	for i := 0; i < len(cmds); i++ {
+		slot := c.cmdSlot(ctx, cmds[i])
+
+		if i > 0 && slot != lastSlot {
+			cmdsCopy = append(cmdsCopy, NewStatusCmd(ctx, "exec"), NewStatusCmd(ctx, "multi"))
+			multiIndexes = append(multiIndexes, len(cmdsCopy)-1)
+		}
+
+		cmdsCopy = append(cmdsCopy, cmds[i])
+
+		lastSlot = slot
+	}
+
+	cmdsCopy = append(cmdsCopy, NewStatusCmd(ctx, "exec"))
+
+	return cmdsCopy, multiIndexes
+}
+
 func (c *ClusterClient) processTxPipelineNodeConn(
-	ctx context.Context, node *clusterNode, cn *pool.Conn, cmds []Cmder, failedCmds *cmdsMap,
+	ctx context.Context, node *clusterNode, cn *pool.Conn, cmds []Cmder, multiIndexes []int, failedCmds *cmdsMap,
 ) error {
 	if err := cn.WithWriter(c.context(ctx), c.opt.WriteTimeout, func(wr *proto.Writer) error {
 		return writeCmds(wr, cmds)
@@ -1496,24 +1555,53 @@ func (c *ClusterClient) processTxPipelineNodeConn(
 	}
 
 	return cn.WithReader(c.context(ctx), c.opt.ReadTimeout, func(rd *proto.Reader) error {
-		statusCmd := cmds[0].(*StatusCmd)
-		// Trim multi and exec.
-		trimmedCmds := cmds[1 : len(cmds)-1]
+		errorsCollection := []error{}
 
-		if err := c.txPipelineReadQueued(
-			ctx, rd, statusCmd, trimmedCmds, failedCmds,
-		); err != nil {
-			setCmdsErr(cmds, err)
-
-			moved, ask, addr := isMovedError(err)
-			if moved || ask {
-				return c.cmdsMoved(ctx, trimmedCmds, moved, ask, addr, failedCmds)
+		// Use the index of each transaction to help check the expected responses
+		for i := 0; i < len(multiIndexes); i++ {
+			statusCmd, ok := cmds[multiIndexes[i]].(*StatusCmd)
+			if !ok {
+				return errors.New("unexpected cmd type found")
 			}
 
-			return err
+			exec := len(cmds)
+
+			if len(multiIndexes) != i+1 {
+				exec = multiIndexes[i+1]
+			}
+
+			// Trim multi and exec off this transaction
+			trimmedCmds := cmds[multiIndexes[i]+1 : exec-1]
+
+			if err := c.txPipelineReadQueued(
+				ctx, rd, statusCmd, trimmedCmds, failedCmds,
+			); err != nil {
+				setCmdsErr(trimmedCmds, err)
+
+				moved, ask, addr := isMovedError(err)
+				if moved || ask {
+					err = c.cmdsMoved(ctx, trimmedCmds, moved, ask, addr, failedCmds)
+					if err != nil {
+						errorsCollection = append(errorsCollection, err)
+					}
+					continue
+				}
+
+				errorsCollection = append(errorsCollection, err)
+				continue
+			}
+
+			if err := pipelineReadCmds(rd, trimmedCmds); err != nil {
+				errorsCollection = append(errorsCollection, err)
+				continue
+			}
 		}
 
-		return pipelineReadCmds(rd, trimmedCmds)
+		if len(errorsCollection) != 0 {
+			return errors.Join(errorsCollection...)
+		}
+
+		return nil
 	})
 }
 
